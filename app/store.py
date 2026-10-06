@@ -4,6 +4,10 @@
 ----
 * 不可变观测日志：所有提交（接受 / 重放 / 拒绝）只追加、不修改、不删除，
   最多 32 条。
+* 不可变首次回执：观测被接受的那一刻，其状态、协方差对角线、残差与结论
+  即被冻结为「首次回执」；之后窗口内迟到观测重算后缀只更新当前轨迹投影，
+  绝不改写任何已接受观测的首次回执。同标识同内容的重传（无论重放前后或
+  重开后）一律返回该冻结回执，而非最新投影中同一时刻的结果。
 * 单调修订号：仅当一次纳入成功发布新轨迹时修订号 +1；任何拒绝/重放都不改变它。
 * 固定滞后窗口规则：迟到观测只有落在 ``最新采样时刻 - lag`` 之内才会被接受，
   窗口外、同标识内容冲突、顺序违规等一律拒绝且保持已发布轨迹不变。
@@ -14,6 +18,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -72,6 +77,9 @@ class Store:
         self._next_seq = 0
         self._revision = 0
         self._track: Optional[Track] = None
+        # 不可变首次回执：seq -> 首次接受时冻结的回执（状态/P 对角/残差/结论）。
+        # 一旦写入永不更新；迟到观测只改轨迹投影，不碰历史回执。
+        self._receipts: Dict[int, Dict[str, Any]] = {}
         self._generation = 0  # 计算代际；每次发起纳入 +1，用于旧结果抑制
         # 测试钩子：重放前调用（例如注入延迟以制造并发交错）
         self.before_replay_hook = None
@@ -105,6 +113,7 @@ class Store:
             self._next_seq = 0
             self._revision = 0
             self._track = None
+            self._receipts = {}
             self._generation += 1
             self._persist_locked()
             return self.state_locked()
@@ -181,15 +190,19 @@ class Store:
                 self._track = self._build_track(result, new_obs)
                 self._revision = base_revision + 1
                 point = next(p for p in self._track.points if p["seq"] == new_obs.seq)
+                receipt = self._snapshot_of(point)
+                # 首次回执在此冻结，之后任何后缀重算都不得改写（setdefault 双保险）。
+                receipt["decision"] = ACCEPTED
+                receipt["revision"] = self._revision
+                self._receipts.setdefault(new_obs.seq, receipt)
                 entry = {
                     **new_obs.to_dict(),
                     "decision": ACCEPTED,
                     "reason": "纳入并自检查点重放后缀成功",
                     "revision": self._revision,
-                    "snapshot": self._snapshot_of(point),
+                    "snapshot": copy.deepcopy(self._receipts[new_obs.seq]),
                 }
                 self._log.append(entry)
-                self._synchronize_accepted_snapshots_locked()
                 self._generation += 1
                 self._persist_locked()
                 return self._decision_response_locked(entry)
@@ -291,18 +304,6 @@ class Store:
             "projection_revision": self._revision,
         }
 
-    def _synchronize_accepted_snapshots_locked(self) -> None:
-        if self._track is None:
-            return
-        points_by_seq = {point["seq"]: point for point in self._track.points}
-        for entry in self._log:
-            if entry["decision"] != ACCEPTED:
-                continue
-            point = points_by_seq.get(entry["seq"])
-            if point is None:
-                continue
-            entry["snapshot"] = self._snapshot_of(point)
-
     def _build_track(self, result: Any, new_obs: Observation) -> Track:
         """把重放结果与观测序号对齐，构造可发布轨迹。"""
         accepted_sorted = sorted(
@@ -326,6 +327,22 @@ class Store:
     # ------------------------------------------------------------------ #
 
     def _replay_locked(self, original: Dict[str, Any], fields: Dict[str, Any]) -> Dict[str, Any]:
+        # 命中的历史记录本身可能也是一条 REPLAYED：沿 replayed_from_seq 找到
+        # 首次 ACCEPTED 记录与冻结回执。
+        root = original
+        seen = set()
+        while root.get("decision") == REPLAYED and root.get("replayed_from_seq") is not None:
+            if root["seq"] in seen:
+                break
+            seen.add(root["seq"])
+            parent = next((e for e in self._log if e["seq"] == root["replayed_from_seq"]), None)
+            if parent is None:
+                break
+            root = parent
+        # 重传永远返回首次接受时冻结的回执（状态/P 对角/残差及其结论），
+        # 而非最新轨迹投影中同一时刻的结果。
+        frozen = self._receipts.get(root["seq"])
+        snapshot = copy.deepcopy(frozen) if frozen is not None else copy.deepcopy(root.get("snapshot"))
         entry = {
             "seq": self._next_seq,
             "id": fields["id"],
@@ -333,10 +350,10 @@ class Store:
             "x": fields["x"],
             "y": fields["y"],
             "decision": REPLAYED,
-            "reason": f"同标识同内容回放原结论（首次见 seq={original['seq']}，修订 {original['revision']}）",
+            "reason": f"同标识同内容回放原结论（首次见 seq={root['seq']}，修订 {root.get('revision')}）",
             "revision": None,
-            "snapshot": original["snapshot"],
-            "replayed_from_seq": original["seq"],
+            "snapshot": snapshot,
+            "replayed_from_seq": root["seq"],
         }
         self._next_seq += 1
         self._log.append(entry)
@@ -382,6 +399,7 @@ class Store:
 
     def _decision_response_locked(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         state = self.state_locked()
+        snapshot = entry.get("snapshot")
         return {
             "seq": entry["seq"],
             "id": entry["id"],
@@ -391,7 +409,10 @@ class Store:
             "decision": entry["decision"],
             "reason": entry["reason"],
             "revision": entry.get("revision"),
-            "snapshot": entry.get("snapshot"),
+            "snapshot": snapshot,
+            # 首次回执自带的对应结论（重传时即为首次接受时的结论与修订号）
+            "receipt_decision": snapshot.get("decision") if isinstance(snapshot, dict) else None,
+            "receipt_revision": snapshot.get("revision") if isinstance(snapshot, dict) else None,
             "current": state["current"],
             "track_revision": state["revision"],
             "log_size": len(self._log),
@@ -511,6 +532,8 @@ class Store:
             "revision": self._revision,
             "log": self._log,
             "track": self._track.to_dict() if self._track else None,
+            # 不可变首次回执：与日志分开保存，任何后缀重算都不触碰它。
+            "receipts": {str(seq): receipt for seq, receipt in self._receipts.items()},
         }
         directory = os.path.dirname(os.path.abspath(self._path))
         os.makedirs(directory, exist_ok=True)
@@ -540,3 +563,101 @@ class Store:
         self._next_seq = int(data.get("next_seq", len(self._log)))
         self._revision = int(data.get("revision", 0))
         self._track = Track.from_dict(data.get("track"))
+        raw_receipts = data.get("receipts")
+        if isinstance(raw_receipts, dict):
+            for key, receipt in raw_receipts.items():
+                if isinstance(receipt, dict):
+                    self._receipts[int(key)] = copy.deepcopy(receipt)
+        # 旧版本状态文件没有独立回执，且其日志快照可能已被后缀重算改写；
+        # 重开时确定性重建首次回执并修复历史记录，再原子写回。
+        with self._lock:
+            healed = self._heal_receipts_locked(legacy_file=not isinstance(raw_receipts, dict))
+            if healed:
+                self._persist_locked()
+
+    def _heal_receipts_locked(self, legacy_file: bool) -> bool:
+        """恢复首次回执证据：修复被旧版本改写的已接受/重放日志快照。
+
+        新文件中回执独立持久化；旧文件（无 receipts 字段）按接受顺序逐前缀
+        确定性重放重建。返回是否发生了修复（需要写回磁盘）。
+        """
+        accepted = [e for e in self._log if e["decision"] == ACCEPTED]
+        rebuilt: Dict[int, Dict[str, Any]] = {}
+        if legacy_file and self._smoother is not None and accepted:
+            rebuilt = self._rebuild_original_receipts_locked()
+
+        changed = False
+        for entry in accepted:
+            seq = int(entry["seq"])
+            receipt = self._receipts.get(seq)
+            if receipt is None:
+                receipt = rebuilt.get(seq)
+                if receipt is not None:
+                    self._receipts[seq] = copy.deepcopy(receipt)
+                    changed = True
+            if receipt is not None and entry.get("snapshot") != receipt:
+                entry["snapshot"] = copy.deepcopy(receipt)
+                changed = True
+
+        # 历史重放记录同样恢复为可复核的原始回执引用内容
+        entries_by_seq = {int(e["seq"]): e for e in self._log}
+        for entry in self._log:
+            if entry["decision"] != REPLAYED:
+                continue
+            # 旧版本的 replayed_from_seq 可能指向另一条 REPLAYED：沿链找到首次接受
+            root = entry
+            guard = set()
+            while root is not None and root.get("decision") == REPLAYED:
+                seq = int(root["seq"])
+                if seq in guard:
+                    root = None
+                    break
+                guard.add(seq)
+                parent_seq = root.get("replayed_from_seq")
+                root = entries_by_seq.get(int(parent_seq)) if parent_seq is not None else None
+            if root is not None and root.get("decision") == ACCEPTED:
+                fixed = copy.deepcopy(root.get("snapshot"))
+                if fixed is not None and entry.get("snapshot") != fixed:
+                    entry["snapshot"] = fixed
+                    changed = True
+        return changed
+
+    def _rebuild_original_receipts_locked(self) -> Dict[int, Dict[str, Any]]:
+        """按接受顺序逐前缀确定性重放，重建每条已接受观测的首次回执。
+
+        第 k 条（0 起）已接受观测被接受时，已接受集合恰为按接收顺序的前
+        k+1 条；对该集合执行与首次发布完全相同的重放，即逐位复现它当时的
+        状态 / 协方差对角线 / 残差（投影修订号为 k+1）。
+        """
+        receipts: Dict[int, Dict[str, Any]] = {}
+        accepted_entries = [e for e in self._log if e["decision"] == ACCEPTED]
+        for k, entry in enumerate(accepted_entries):
+            subset = [
+                Observation(
+                    seq=int(e["seq"]),
+                    obs_id=str(e["id"]),
+                    timestamp=float(e["timestamp"]),
+                    x=float(e["x"]),
+                    y=float(e["y"]),
+                )
+                for e in accepted_entries[: k + 1]
+            ]
+            try:
+                result = self._smoother.replay(subset, k + 1)  # type: ignore[union-attr]
+            except KalmanError:
+                # 数值上无法重建该前缀时保留既有记录，不阻断重开
+                continue
+            ordered = sorted(subset, key=lambda o: (o.timestamp, o.seq))
+            for obs, point in zip(ordered, result.points):
+                if obs.seq != int(entry["seq"]):
+                    continue
+                receipts[obs.seq] = {
+                    "timestamp": point.timestamp,
+                    "state": [float(v) for v in point.state],
+                    "P_diag": [float(v) for v in la.diag(point.cov)],
+                    "residual": [float(v) for v in point.residual],
+                    "projection_revision": k + 1,
+                    "decision": ACCEPTED,
+                    "revision": k + 1,
+                }
+        return receipts

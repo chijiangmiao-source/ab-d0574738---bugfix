@@ -41,6 +41,10 @@ services:
     environment:
       BASE_URL: "http://web:${PORT:-8080}"
       VERIFY_RESET: "1"
+      # 阶段 4 在持久化卷上拉起一次性服务并重启，核对首次回执不可变与重开恢复
+      VERIFY_STATE_FILE: /data/verify-state.json
+    volumes:
+      - nav-data:/data
     # 执行完验收即退出，退出码即验收结论（compose 会显示 Exited (0)）
     command: ["python3", "scripts/verify.py"]
     restart: "no"

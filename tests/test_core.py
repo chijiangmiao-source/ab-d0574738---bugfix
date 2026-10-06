@@ -1,5 +1,6 @@
 """核心规则测试：重放、窗口、修订、持久化与旧结果抑制。"""
 
+import json
 import math
 import os
 import tempfile
@@ -202,6 +203,137 @@ class TestStoreRules(unittest.TestCase):
     def test_residuals_returned(self):
         r = self.submit("A", 1.0, 5.0, 5.0)
         self.assertEqual(len(r["snapshot"]["residual"]), 2)
+
+
+class TestImmutableReceipts(unittest.TestCase):
+    """首次回执不可变：迟到观测只修后缀，历史回执证据恒定，重开可恢复。"""
+
+    def setUp(self):
+        self.fd, self.path = tempfile.mkstemp(suffix=".json")
+        os.close(self.fd)
+        self.store = Store(path=self.path, config=cfg(lag=2.0))
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def submit(self, store, oid, t, x, y):
+        return store.submit_observation({"id": oid, "timestamp": t, "x": x, "y": y})
+
+    def _seed_three_and_late(self):
+        a = self.submit(self.store, "A", 1.0, 1.0, 0.0)
+        b = self.submit(self.store, "B", 2.0, 2.0, 0.0)
+        c = self.submit(self.store, "C", 3.0, 3.0, 0.0)
+        middle_receipt = b["snapshot"]
+        # 落在滞后窗口内、采样时刻位于前两条之间的迟到观测
+        late = self.submit(self.store, "LATE", 1.5, 1.2, 0.5)
+        self.assertEqual(late["decision"], ACCEPTED)
+        return a, b, c, middle_receipt, late
+
+    def test_retransmit_returns_first_receipt_not_latest_projection(self):
+        _a, b, _c, middle_receipt, late = self._seed_three_and_late()
+        state = self.store.state()
+        projected_b = next(p for p in state["track"]["points"] if p["seq"] == b["seq"])
+        # 前置事实：迟到观测确实修正了当前后缀（t=2 的当前投影已变化）
+        self.assertNotEqual(projected_b["state"], middle_receipt["state"])
+        self.assertEqual(late["track_revision"], 4)
+
+        again = self.submit(self.store, "B", 2.0, 2.0, 0.0)
+        self.assertEqual(again["decision"], REPLAYED)
+        self.assertEqual(again["track_revision"], 4)  # 当前轨迹仍是最新修订
+        # 重传必须返回首次接受时的状态/P 对角/残差及其结论，而非最新投影
+        self.assertEqual(again["snapshot"], middle_receipt)
+        self.assertEqual(again["receipt_decision"], ACCEPTED)
+        self.assertEqual(again["receipt_revision"], b["revision"])
+
+    def test_history_log_evidence_unchanged_after_suffix_recompute(self):
+        _a, b, _c, middle_receipt, _late = self._seed_three_and_late()
+        log_b = next(e for e in self.store.state()["log"] if e["id"] == "B" and e["decision"] == ACCEPTED)
+        self.assertEqual(log_b["snapshot"], middle_receipt)
+        self.assertEqual(log_b["revision"], 2)
+
+    def test_retransmit_after_reopen_still_returns_first_receipt(self):
+        _a, _b, _c, middle_receipt, _late = self._seed_three_and_late()
+        reopened = Store(path=self.path)
+        again = self.submit(reopened, "B", 2.0, 2.0, 0.0)
+        self.assertEqual(again["decision"], REPLAYED)
+        self.assertEqual(again["snapshot"], middle_receipt)
+        self.assertEqual(again["receipt_decision"], ACCEPTED)
+        # 当前轨迹、单调修订号、封存位置在重开后保持正确
+        state = reopened.state()
+        self.assertEqual(state["revision"], 4)
+        self.assertEqual(state["anchor_seq"], 0)
+        self.assertEqual([p["timestamp"] for p in state["track"]["points"]], [1.0, 1.5, 2.0, 3.0])
+
+    def test_replay_of_a_replay_resolves_to_original_receipt(self):
+        _a, b, _c, middle_receipt, _late = self._seed_three_and_late()
+        first_replay = self.submit(self.store, "B", 2.0, 2.0, 0.0)
+        second_replay = self.submit(self.store, "B", 2.0, 2.0, 0.0)
+        self.assertEqual(first_replay["snapshot"], middle_receipt)
+        self.assertEqual(second_replay["snapshot"], middle_receipt)
+        # 两条重放记录都指向首次接受的 seq
+        replays = [
+            e for e in self.store.state()["log"]
+            if e["decision"] == REPLAYED and e["id"] == "B"
+        ]
+        self.assertEqual(len(replays), 2)
+        self.assertTrue(all(e["replayed_from_seq"] == b["seq"] for e in replays))
+        # 重开后经由 REPLAYED 链仍能找回原始回执
+        reopened = Store(path=self.path)
+        after = self.submit(reopened, "B", 2.0, 2.0, 0.0)
+        self.assertEqual(after["snapshot"], middle_receipt)
+
+    def test_multiple_late_observations_keep_all_first_receipts(self):
+        self.submit(self.store, "A", 1.0, 1.0, 0.0)
+        b = self.submit(self.store, "B", 3.0, 3.0, 0.0)
+        b_receipt = b["snapshot"]
+        self.submit(self.store, "L1", 1.5, 1.2, 0.5)
+        self.submit(self.store, "L2", 2.0, 2.4, 0.2)
+        self.submit(self.store, "L3", 2.5, 2.6, -0.2)
+        for oid, receipt in (("B", b_receipt),):
+            again = self.submit(self.store, oid, 3.0, 3.0, 0.0)
+            self.assertEqual(again["decision"], REPLAYED)
+            self.assertEqual(again["snapshot"], receipt)
+
+    def test_corrupted_legacy_state_is_healed_on_reopen(self):
+        _a, b, _c, middle_receipt, _late = self._seed_three_and_late()
+        # 模拟旧版本已落盘的“被改写的历史回执”：无 receipts 字段，且 B 的
+        # 日志快照已被迟到观测修正后的投影覆盖。
+        with open(self.path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        del data["receipts"]
+        projected = next(p for p in data["track"]["points"] if p["seq"] == b["seq"])
+        for entry in data["log"]:
+            if entry["id"] == "B" and entry["decision"] == ACCEPTED:
+                entry["snapshot"] = {
+                    "timestamp": projected["timestamp"],
+                    "state": projected["state"],
+                    "P_diag": projected["P_diag"],
+                    "residual": projected["residual"],
+                    "projection_revision": 4,
+                }
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+        reopened = Store(path=self.path)
+        healed_b = next(
+            e for e in reopened.state()["log"] if e["id"] == "B" and e["decision"] == ACCEPTED
+        )
+        self.assertEqual(healed_b["snapshot"], middle_receipt)
+        again = self.submit(reopened, "B", 2.0, 2.0, 0.0)
+        self.assertEqual(again["snapshot"], middle_receipt)
+        # 当前轨迹、单调修订号、封存位置保持正确
+        state = reopened.state()
+        self.assertEqual(state["revision"], 4)
+        self.assertEqual(state["anchor_seq"], 0)
+        self.assertEqual([p["timestamp"] for p in state["track"]["points"]], [1.0, 1.5, 2.0, 3.0])
+        # 修复结果已持久化，再次重开无需重建
+        with open(self.path, "r", encoding="utf-8") as fh:
+            healed_file = json.load(fh)
+        self.assertIn("receipts", healed_file)
+        reopened2 = Store(path=self.path)
+        self.assertEqual(
+            self.submit(reopened2, "B", 2.0, 2.0, 0.0)["snapshot"], middle_receipt
+        )
 
 
 class TestPersistence(unittest.TestCase):

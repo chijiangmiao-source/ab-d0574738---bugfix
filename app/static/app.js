@@ -199,7 +199,10 @@ $("btnObs").addEventListener("click", async () => {
   if (data.decision === "ACCEPTED") {
     setMsg($("obsMsg"), "ok", `接受：发布修订 ${data.track_revision}，当前位置 ${fmtArr(data.current ? data.current.position : null)}`);
   } else if (data.decision === "REPLAYED") {
-    setMsg($("obsMsg"), "info", `重放：${data.reason}（轨迹与修订号不变，仍为 ${data.track_revision}）`);
+    const receiptRev = data.receipt_revision === null || data.receipt_revision === undefined
+      ? ""
+      : `（首次回执修订 ${data.receipt_revision}）`;
+    setMsg($("obsMsg"), "info", `重放：${data.reason}${receiptRev}；回执为首次接受证据，当前轨迹仍为修订 ${data.track_revision}`);
   } else {
     setMsg($("obsMsg"), "err", `拒绝：${data.reason || data.error || "未说明"}（已发布轨迹保持不变）`);
   }
