@@ -41,6 +41,10 @@ services:
     environment:
       BASE_URL: "http://web:${PORT:-8080}"
       VERIFY_RESET: "1"
+      # 重开场景的状态文件落在与 web 相同的持久化卷上
+      VERIFY_STATE_DIR: /data
+    volumes:
+      - nav-data:/data
     # 执行完验收即退出，退出码即验收结论（compose 会显示 Exited (0)）
     command: ["python3", "scripts/verify.py"]
     restart: "no"

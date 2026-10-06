@@ -1,5 +1,6 @@
 """核心规则测试：重放、窗口、修订、持久化与旧结果抑制。"""
 
+import json
 import math
 import os
 import tempfile
@@ -229,6 +230,197 @@ class TestPersistence(unittest.TestCase):
             self.assertEqual(replay["decision"], REPLAYED)
         finally:
             os.unlink(path)
+
+
+class TestFirstReceiptImmutability(unittest.TestCase):
+    """首次回执不可变：窗口内迟到观测修正当前后缀，但不得改写任何
+    已接受观测首次接受时返回的状态/协方差对角/残差。"""
+
+    def setUp(self):
+        # lag 足够大，保证 t=1.5 的迟到观测落在窗口内
+        self.store = Store(config=cfg(lag=3.0))
+
+    def submit(self, oid, t, x, y):
+        return self.store.submit_observation(
+            {"id": oid, "timestamp": t, "x": x, "y": y}
+        )
+
+    def _receipt(self, resp):
+        return {
+            "state": list(resp["snapshot"]["state"]),
+            "P_diag": list(resp["snapshot"]["P_diag"]),
+            "residual": list(resp["snapshot"]["residual"]),
+            "timestamp": resp["snapshot"]["timestamp"],
+        }
+
+    def test_scenario_save_late_retransmit(self):
+        # 采样时刻依次递增的三条定位观测，保存中间一条首次接受的回执
+        self.submit("A", 1.0, 1.0, 0.0)
+        mid = self.submit("B", 2.0, 2.0, 0.0)
+        self.submit("C", 3.0, 3.0, 0.0)
+        first_receipt = self._receipt(mid)
+        self.assertEqual(mid["decision"], ACCEPTED)
+
+        # 落在滞后窗口内、采样时刻位于前两条之间的迟到观测：当前轨迹重算
+        late = self.submit("LATE", 1.5, 1.2, 0.5)
+        self.assertEqual(late["decision"], ACCEPTED)
+        self.assertEqual(late["track_revision"], 4)
+        st = self.store.state()
+        # 当前后缀（t=2 的最新投影）确实已被迟到观测修正
+        cur_t2 = next(p for p in st["track"]["points"] if p["timestamp"] == 2.0)
+        self.assertNotEqual(cur_t2["state"], first_receipt["state"])
+
+        # 再次以中间观测的稳定标识和完全相同内容提交：REPLAYED，
+        # 但回执必须是首次接受证据，而不是最新投影在同一时刻的结果
+        again = self.submit("B", 2.0, 2.0, 0.0)
+        self.assertEqual(again["decision"], REPLAYED)
+        self.assertEqual(self._receipt(again), first_receipt)
+        self.assertEqual(again["track_revision"], 4)  # 修订号不增加
+        # 日志中首次接受行的快照证据同样保持不变
+        log_b = next(
+            e for e in self.store.state()["log"]
+            if e["id"] == "B" and e["decision"] == ACCEPTED
+        )
+        self.assertEqual(log_b["snapshot"]["state"], first_receipt["state"])
+        self.assertEqual(log_b["snapshot"]["P_diag"], first_receipt["P_diag"])
+        self.assertEqual(log_b["snapshot"]["residual"], first_receipt["residual"])
+
+    def test_earlier_sealed_observation_receipt_also_immutable(self):
+        self.submit("A", 1.0, 1.0, 0.0)
+        first_a = self.submit("A2", 2.0, 2.0, 0.0)
+        self.submit("C", 3.0, 3.0, 0.0)
+        a_receipt = self._receipt(first_a)
+        self.submit("LATE", 1.5, 1.2, 0.5)
+        again = self.submit("A2", 2.0, 2.0, 0.0)
+        self.assertEqual(again["decision"], REPLAYED)
+        self.assertEqual(self._receipt(again), a_receipt)
+
+
+class TestFirstReceiptPersistence(unittest.TestCase):
+    """在持久化数据卷上覆盖：保存首次回执 → 窗口内迟到观测 → 同标识重传
+    → 重开后再次重传；历史回执恒定而当前后缀确已更新。"""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    @staticmethod
+    def _receipt(resp):
+        return {
+            "state": list(resp["snapshot"]["state"]),
+            "P_diag": list(resp["snapshot"]["P_diag"]),
+            "residual": list(resp["snapshot"]["residual"]),
+        }
+
+    def _drive(self, store):
+        store.submit_observation({"id": "A", "timestamp": 1.0, "x": 1.0, "y": 0.0})
+        mid = store.submit_observation(
+            {"id": "B", "timestamp": 2.0, "x": 2.0, "y": 0.0}
+        )
+        store.submit_observation({"id": "C", "timestamp": 3.0, "x": 3.0, "y": 0.0})
+        store.submit_observation(
+            {"id": "LATE", "timestamp": 1.5, "x": 1.2, "y": 0.5}
+        )
+        return self._receipt(mid)
+
+    def test_reopen_keeps_first_receipt_and_updated_suffix(self):
+        s1 = Store(path=self.path, config=cfg(lag=3.0))
+        first = self._drive(s1)
+        before_replay = s1.submit_observation(
+            {"id": "B", "timestamp": 2.0, "x": 2.0, "y": 0.0}
+        )
+        self.assertEqual(before_replay["decision"], REPLAYED)
+        self.assertEqual(self._receipt(before_replay), first)
+        st1 = s1.state()
+        cur_t2 = next(p for p in st1["track"]["points"] if p["timestamp"] == 2.0)
+        self.assertNotEqual(cur_t2["state"], first["state"])
+
+        # 关闭并重新打开服务：被改写历史回执的缺陷不得重现
+        s2 = Store(path=self.path)
+        st2 = s2.state()
+        self.assertEqual(st2["revision"], st1["revision"])          # 单调修订号
+        self.assertEqual(st2["track"], st1["track"])                # 当前轨迹一致
+        self.assertEqual(st2["anchor_seq"], st1["anchor_seq"])      # 封存位置一致
+        after_reopen = s2.submit_observation(
+            {"id": "B", "timestamp": 2.0, "x": 2.0, "y": 0.0}
+        )
+        self.assertEqual(after_reopen["decision"], REPLAYED)
+        self.assertEqual(self._receipt(after_reopen), first)
+        log_b = next(
+            e for e in st2["log"] if e["id"] == "B" and e["decision"] == ACCEPTED
+        )
+        self.assertEqual(log_b["snapshot"]["state"], first["state"])
+
+    def test_reopen_normal_v2_volume_is_byte_stable(self):
+        s1 = Store(path=self.path, config=cfg(lag=3.0))
+        self._drive(s1)
+        with open(self.path, encoding="utf-8") as fh:
+            raw = fh.read()
+        Store(path=self.path)  # 重开不应触发无谓的改写
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), raw)
+
+    def test_corrupted_v1_volume_is_healed_on_reopen(self):
+        # 用现版本跑出完整场景后，人工改写成旧版（v1）落盘：旧版曾把每条
+        # ACCEPTED/REPLAYED 行的快照覆盖为最新轨迹投影，且没有独立回执台账。
+        s1 = Store(path=self.path, config=cfg(lag=3.0))
+        first = self._drive(s1)
+        replayed = s1.submit_observation(
+            {"id": "B", "timestamp": 2.0, "x": 2.0, "y": 0.0}
+        )
+        self.assertEqual(replayed["decision"], REPLAYED)
+
+        with open(self.path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        by_seq = {p["seq"]: p for p in data["track"]["points"]}
+        for e in data["log"]:
+            if e["decision"] == ACCEPTED:
+                p = by_seq[e["seq"]]
+            elif e["decision"] == REPLAYED:
+                p = by_seq[e["replayed_from_seq"]]
+            else:
+                continue
+            e["snapshot"] = {
+                "timestamp": p["timestamp"],
+                "state": list(p["state"]),
+                "P_diag": list(p["P_diag"]),
+                "residual": list(p["residual"]),
+                "projection_revision": data["revision"],
+            }
+        data.pop("receipts", None)
+        data["version"] = 1
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+        s2 = Store(path=self.path)  # 重开即自愈
+        with open(self.path, encoding="utf-8") as fh:
+            healed = json.load(fh)
+        self.assertEqual(healed["version"], 2)
+        # 已受影响的持久化记录恢复为可复核的原始回执
+        log_b = next(
+            e for e in healed["log"] if e["id"] == "B" and e["decision"] == "ACCEPTED"
+        )
+        self.assertEqual(log_b["snapshot"]["state"], first["state"])
+        self.assertEqual(log_b["snapshot"]["P_diag"], first["P_diag"])
+        self.assertEqual(log_b["snapshot"]["residual"], first["residual"])
+        # 历史 REPLAYED 行同样恢复为首次回执
+        rep_row = next(
+            e for e in healed["log"] if e["decision"] == "REPLAYED"
+        )
+        self.assertEqual(rep_row["snapshot"]["state"], first["state"])
+        # 当前轨迹、单调修订号、封存位置保持重开前的正确性
+        self.assertEqual(s2.state()["track"], data["track"])
+        self.assertEqual(s2.state()["revision"], data["revision"])
+        self.assertEqual(s2.state()["anchor_seq"], data["track"]["anchor_seq"])
+        again = s2.submit_observation(
+            {"id": "B", "timestamp": 2.0, "x": 2.0, "y": 0.0}
+        )
+        self.assertEqual(again["decision"], REPLAYED)
+        self.assertEqual(self._receipt(again), first)
 
 
 class TestStaleResultSuppression(unittest.TestCase):

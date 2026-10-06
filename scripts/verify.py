@@ -2,11 +2,15 @@
 """可执行验收服务 verify。
 
 执行顺序（任一阶段失败立即以非零退出码结束）：
-  1. 代码测试：迟到观测重放 / 窗口规则、重开恢复、旧结果抑制等（unittest）。
+  1. 代码测试：首次回执不可变 / 迟到观测重放 / 窗口规则、重开恢复（含
+     历史 v1 卷自愈）、旧结果抑制等（unittest）。
   2. 构建检查：字节编译全部 Python 源码；校验可交付页面资产
      （index.html / app.js 存在且相互引用；若环境有 node，则做 JS 语法检查）。
   3. HTTP 冒烟：健康地址 + 页面静态资源 + 全部业务 API/HTTP 路径，
      并核对接受 / 重放 / 拒绝结论、单调修订号与窗口外不变性。
+  4. 持久化卷重开场景（仅自托管模式）：保存首次回执 → 窗口内迟到观测 →
+     同标识重传 → 关闭进程后在同一状态文件上重开 → 再次重传，
+     核对历史回执恒定而当前后缀确已更新。
 
 目标服务：
   * 设置环境变量 BASE_URL（如 http://web:8080）时对该地址冒烟；
@@ -170,6 +174,8 @@ def smoke(base: str) -> bool:
     ok = True
 
     ok = check("健康地址 GET /healthz 返回 200/ok", wait_healthy(base)) and ok
+    if not ok:
+        return False  # 目标不可达：后续调用无意义，直接以 FAIL/退出码 1 结束
 
     # 保证验收可重复执行：先清空任何历史数据（持久化卷上的旧状态）
     http_json("POST", base + "/api/reset", {})
@@ -274,6 +280,174 @@ def smoke(base: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 阶段 4：持久化卷上的首次回执场景（保存首次回执 → 窗口内迟到观测
+#          → 同标识重传 → 重开后再次重传）
+# ---------------------------------------------------------------------------
+
+RECEIPT_CONFIG = {
+    "x0": [0, 0, 1, 0],
+    "P0": [[10, 0, 0, 0], [0, 10, 0, 0], [0, 0, 4, 0], [0, 0, 0, 4]],
+    "q": 0.5,
+    "r": 1,
+    "lag": 2,
+}
+
+
+def _receipt_key(body: dict) -> dict:
+    snap = body.get("snapshot") or {}
+    return {
+        "timestamp": snap.get("timestamp"),
+        "state": snap.get("state"),
+        "P_diag": snap.get("P_diag"),
+        "residual": snap.get("residual"),
+    }
+
+
+def prepare_receipt_scenario(base: str):
+    """重置后在卷上建立：保存中间观测首次回执 → 录入窗口内迟到观测 →
+    同标识重传。返回 (first_receipt, state_before_retransmit)。"""
+    http_json("POST", base + "/api/reset", {})
+    status, _ = http_json("POST", base + "/api/config", RECEIPT_CONFIG)
+    assert status == 200
+
+    def obs(oid, t, x, y):
+        return http_json("POST", base + "/api/observations", {"id": oid, "timestamp": t, "x": x, "y": y})
+
+    obs("RCP-A", 1.0, 1.0, 0.0)
+    _, mid = obs("RCP-B", 2.0, 2.0, 0.0)  # 保存中间一条被接受时返回的回执
+    obs("RCP-C", 3.0, 3.0, 0.0)
+    # 采样时刻位于前两条之间、落在滞后窗口（lag=2）内的迟到观测
+    _, late = obs("RCP-LATE", 1.5, 1.2, 0.5)
+    return mid, late
+
+
+def check_receipt_retransmit(base: str, first_receipt: dict, tag: str) -> bool:
+    """同标识同内容重传：REPLAYED 且回执恒为首次接受证据。"""
+    ok = True
+
+    def obs(oid, t, x, y):
+        return http_json("POST", base + "/api/observations", {"id": oid, "timestamp": t, "x": x, "y": y})
+
+    _, state = http_json("GET", base + "/api/state")
+    cur_t2 = next(p for p in state["track"]["points"] if p["timestamp"] == 2.0)
+    ok = check(
+        f"{tag}：窗口内迟到观测已修正当前后缀（t=2 最新投影≠首次回执）",
+        cur_t2["state"] != first_receipt["state"],
+    ) and ok
+    ok = check(
+        f"{tag}：当前轨迹含迟到观测时刻 1.5，修订号=4",
+        [p["timestamp"] for p in state["track"]["points"]] == [1.0, 1.5, 2.0, 3.0]
+        and state["revision"] == 4,
+    ) and ok
+    ok = check(
+        f"{tag}：封存检查点指向最早观测（anchor_seq=0，lag=2 边界 t=1）",
+        state.get("anchor_seq") == 0,
+    ) and ok
+
+    _, again = obs("RCP-B", 2.0, 2.0, 0.0)
+    got = _receipt_key(again)
+    ok = check(
+        f"{tag}：同标识同内容重传返回 REPLAYED 且首次回执恒定（state/P_diag/residual）",
+        again.get("decision") == "REPLAYED"
+        and got == first_receipt
+        and again.get("track_revision") == 4,
+        f"got={got}",
+    ) and ok
+
+    # 回归：同标识异内容冲突
+    _, conflict = obs("RCP-B", 2.0, 2.0, 0.9)
+    ok = check(f"{tag}：同标识异内容冲突仍拒绝", conflict.get("decision") == "REJECTED") and ok
+    return ok, state
+
+
+def receipt_smoke(base: str) -> bool:
+    print(f"== 阶段 4：持久化卷首次回执场景（{base}） ==")
+    mid, late = prepare_receipt_scenario(base)
+    ok = True
+    ok = check(
+        "保存首次回执：三条递增观测接受、中间观测回执含 state/P_diag/residual",
+        mid.get("decision") == "ACCEPTED"
+        and late.get("decision") == "ACCEPTED"
+        and all(k in (mid.get("snapshot") or {}) for k in ("state", "P_diag", "residual")),
+    ) and ok
+    first_receipt = _receipt_key(mid)
+    more, _ = check_receipt_retransmit(base, first_receipt, "重开前")
+    return ok and more, first_receipt
+
+
+def reopen_receipt_smoke(base: str, first_receipt: dict) -> bool:
+    """服务以同一持久化状态文件重开后，再次重传仍返回原始首次回执，
+    且当前轨迹/单调修订号/封存位置与重开前一致。"""
+    print(f"== 阶段 5：关闭重开后在持久化卷上再次重传（{base}） ==")
+    ok = check("重开后健康检查通过", wait_healthy(base))
+    more, state = check_receipt_retransmit(base, first_receipt, "重开后")
+    # 重开后：当前轨迹、修订号、封存位置依旧正确
+    ok = check(
+        "重开后当前轨迹仍含迟到后缀、修订号停在 4 且封存检查点保留",
+        [p["timestamp"] for p in state["track"]["points"]] == [1.0, 1.5, 2.0, 3.0]
+        and state["revision"] == 4
+        and state["anchor_seq"] == 0,
+    ) and ok
+    return ok and more
+
+
+def _spawn_server(port: int, state_file: str):
+    return subprocess.Popen(
+        [sys.executable, "-m", "app.server", "--port", str(port), "--state", state_file],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _stop_server(proc) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def run_receipt_restart_cycle() -> bool:
+    """保存首次回执 → 窗口内迟到观测 → 同标识重传 → 关闭 → 在同一持久化
+    状态文件上重开 → 再次重传。始终自管一对服务进程以真实经历“重开”：
+    Compose 下状态文件位于挂载的 nav-data 卷（/data），本地为临时目录。"""
+    state_dir = os.environ.get("VERIFY_STATE_DIR", "").strip()
+    tmp_dir = None
+    if not state_dir:
+        tmp_dir = tempfile.TemporaryDirectory(prefix="nav-verify-vol-")
+        state_dir = tmp_dir.name
+    else:
+        os.makedirs(state_dir, exist_ok=True)
+    state_file = os.path.join(state_dir, "verify-receipt-state.json")
+    if os.path.exists(state_file):
+        os.unlink(state_file)  # 每次验收独立开始；场景内的重开才是被检验对象
+
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    proc = _spawn_server(port, state_file)
+    try:
+        if not wait_healthy(base):
+            return check("重开前验收服务启动（健康检查）", False)
+        ok, first_receipt = receipt_smoke(base)
+        if not ok:
+            return False
+    finally:
+        _stop_server(proc)
+
+    # 关闭服务并在同一持久化状态文件上重新启动
+    proc = _spawn_server(port, state_file)
+    try:
+        ok = reopen_receipt_smoke(base, first_receipt)
+    finally:
+        _stop_server(proc)
+    if tmp_dir is not None:
+        tmp_dir.cleanup()
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -291,16 +465,17 @@ def main() -> int:
             port = _free_port()
             tmp_state = tempfile.NamedTemporaryFile(prefix="nav-verify-", suffix=".json", delete=False)
             tmp_state.close()
-            spawned = subprocess.Popen(
-                [sys.executable, "-m", "app.server", "--port", str(port), "--state", tmp_state.name],
-                cwd=ROOT,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            spawned = _spawn_server(port, tmp_state.name)
             base = f"http://127.0.0.1:{port}"
 
         if not smoke(base):
             return 1
+
+        # 持久化卷上的保存 → 迟到 → 重传 → 重开 → 再重传（自管服务对，
+        # Compose 下落在 nav-data 卷；与上面的冒烟服务互不干扰）。
+        if not run_receipt_restart_cycle():
+            return 1
+
         if os.environ.get("VERIFY_RESET") == "1":
             http("POST", base + "/api/reset", {})
             print("[INFO] 已调用 /api/reset 清理验收数据")
@@ -308,11 +483,7 @@ def main() -> int:
         return 0
     finally:
         if spawned is not None:
-            spawned.terminate()
-            try:
-                spawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                spawned.kill()
+            _stop_server(spawned)
         if tmp_state is not None:
             try:
                 os.unlink(tmp_state.name)
