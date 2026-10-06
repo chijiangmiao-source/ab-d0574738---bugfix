@@ -1,0 +1,49 @@
+# 巡检机返航 · 导航轨迹固定滞后复核
+#
+# 服务：
+#   web     复核页面 + 业务 API + 健康检查（持久化卷保存观测日志与轨迹）
+#   verify  一次性验收服务：代码测试 -> 构建检查 -> 对 web 做 HTTP 冒烟，
+#           执行后退出并以退出码报告验收结果（0=通过）。
+#
+# 可配置端口：HOST_PORT=9090 docker compose up web
+#   HOST_PORT  宿主机映射端口（默认 8080）
+#   PORT       容器内监听端口（默认 8080，一般无需修改）
+
+services:
+  web:
+    build: .
+    image: nav-review:latest
+    ports:
+      - "${HOST_PORT:-8080}:${PORT:-8080}"
+    environment:
+      PORT: "${PORT:-8080}"
+      STATE_FILE: /data/state.json
+    volumes:
+      - nav-data:/data
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import os,urllib.request,sys; p=os.environ.get('PORT','8080'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz', timeout=2).status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    image: nav-review:latest
+    build: .
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      BASE_URL: "http://web:${PORT:-8080}"
+      VERIFY_RESET: "1"
+    # 执行完验收即退出，退出码即验收结论（compose 会显示 Exited (0)）
+    command: ["python3", "scripts/verify.py"]
+    restart: "no"
+
+volumes:
+  nav-data:

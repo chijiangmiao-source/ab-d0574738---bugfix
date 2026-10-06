@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>巡检机返航 · 导航轨迹固定滞后复核</title>
+<style>
+  :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --fg:#e2e8f0;
+          --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
+          --info:#38bdf8; --accent:#6366f1; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line);
+           display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:12px; }
+  main { padding:20px 24px; display:grid; grid-template-columns: 380px 1fr; gap:20px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  section h2 { font-size:15px; margin:0 0 12px; color:var(--info); }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 3px; }
+  input { width:100%; padding:6px 8px; background:#0b1220; color:var(--fg);
+          border:1px solid var(--line); border-radius:6px; font-size:13px; }
+  input:focus { outline:none; border-color:var(--accent); }
+  .row { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+  .row4 { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+  .p0 { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; }
+  .p0 input { text-align:center; padding:5px 4px; }
+  button { margin-top:12px; padding:8px 14px; border:0; border-radius:6px;
+           background:var(--accent); color:#fff; font-size:13px; cursor:pointer; }
+  button:hover { filter:brightness(1.12); }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--muted); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .badge.ACCEPTED { background:rgba(34,197,94,.18); color:var(--ok); }
+  .badge.REPLAYED { background:rgba(56,189,248,.18); color:var(--info); }
+  .badge.REJECTED { background:rgba(239,68,68,.18); color:var(--bad); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:500; position:sticky; top:0; background:var(--panel); }
+  td.wrap { white-space:normal; color:var(--muted); min-width:220px; }
+  .tablewrap { max-height:300px; overflow:auto; border:1px solid var(--line); border-radius:8px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 14px; font-size:13px; }
+  .kv dt { color:var(--muted); }
+  .kv dd { margin:0; font-variant-numeric:tabular-nums; }
+  .msg { margin-top:10px; padding:8px 10px; border-radius:6px; font-size:12px; display:none; }
+  .msg.ok { display:block; background:rgba(34,197,94,.12); color:var(--ok); }
+  .msg.err { display:block; background:rgba(239,68,68,.12); color:var(--bad); }
+  .msg.info { display:block; background:rgba(56,189,248,.12); color:var(--info); }
+  .muted { color:var(--muted); font-size:12px; }
+  .pill { border:1px solid var(--line); border-radius:999px; padding:2px 10px; font-size:12px; color:var(--muted); }
+  .pill b { color:var(--fg); }
+  .two-col { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media (max-width: 800px) { .two-col { grid-template-columns:1fr; } }
+  code { color:#fbbf24; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>巡检机返航 · 导航轨迹固定滞后复核</h1>
+    <div class="sub">二维位置/速度匀速模型 · 不可变观测日志 · 单调修订号 · 迟到观测仅修正滞后窗口内历史后缀</div>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <span class="pill">修订号 <b id="rev">-</b></span>
+    <span class="pill">检查点 seq <b id="anchor">-</b></span>
+    <span class="pill">日志 <b id="logsize">0</b>/32</span>
+  </div>
+</header>
+
+<main>
+  <div style="display:flex;flex-direction:column;gap:20px">
+    <section>
+      <h2>① 建立初值 / 噪声 / 滞后长度</h2>
+      <div class="row4">
+        <div><label>px₀</label><input id="x0_0" type="number" step="any" value="0"></div>
+        <div><label>py₀</label><input id="x0_1" type="number" step="any" value="0"></div>
+        <div><label>vx₀</label><input id="x0_2" type="number" step="any" value="1"></div>
+        <div><label>vy₀</label><input id="x0_3" type="number" step="any" value="0"></div>
+      </div>
+      <label>初始协方差 P₀（4×4，须对称正定）</label>
+      <div class="p0" id="p0grid"></div>
+      <div class="row" style="margin-top:8px">
+        <div><label>过程噪声 q &gt; 0</label><input id="q" type="number" step="any" value="0.5"></div>
+        <div><label>观测噪声 r &gt; 0</label><input id="r" type="number" step="any" value="1"></div>
+        <div><label>滞后长度 lag(s) ≥ 0</label><input id="lag" type="number" step="any" value="2"></div>
+      </div>
+      <button id="btnConfig">建立 / 校验配置</button>
+      <button id="btnReset" class="ghost">重置</button>
+      <div class="muted" id="cfgState" style="margin-top:8px">尚未建立配置</div>
+      <div class="msg" id="cfgMsg"></div>
+    </section>
+
+    <section>
+      <h2>② 按接收顺序录入观测（最多 32 条）</h2>
+      <div class="row4">
+        <div style="grid-column:span 1"><label>稳定标识 id</label><input id="obsId" value="O1"></div>
+        <div><label>采样时刻 t</label><input id="obsT" type="number" step="any" value="1"></div>
+        <div><label>x</label><input id="obsX" type="number" step="any" value="1.1"></div>
+        <div><label>y</label><input id="obsY" type="number" step="any" value="0.15"></div>
+      </div>
+      <button id="btnObs">提交观测</button>
+      <div class="msg" id="obsMsg"></div>
+      <div style="margin-top:12px">
+        <div class="muted">本条结论</div>
+        <div id="lastDecision" class="muted">—</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>③ 当前位置（最新已发布修订）</h2>
+      <dl class="kv" id="current">
+        <dt>时间戳</dt><dd>—</dd>
+        <dt>位置 (px, py)</dt><dd>—</dd>
+        <dt>速度 (vx, vy)</dt><dd>—</dd>
+        <dt>协方差对角</dt><dd>—</dd>
+        <dt>最近残差</dt><dd>—</dd>
+      </dl>
+      <div class="muted" style="margin-top:8px">
+        旧计算结果不会覆盖本区域：页面始终展示服务器最新修订；若在途结果过期将显示“已被抑制”。
+      </div>
+    </section>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:20px">
+    <section>
+      <h2>已发布轨迹点（窗口内迟到观测自检查点重算后缀；封存位置不变）</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr>
+            <th>seq</th><th>采样时刻</th><th>位置 (px, py)</th><th>速度 (vx, vy)</th>
+            <th>协方差对角 (Ppx,Ppy,Pvx,Pvy)</th><th>残差 (rx, ry)</th>
+          </tr></thead>
+          <tbody id="trackBody"><tr><td colspan="6" class="muted">尚无已发布轨迹</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>不可变观测日志（只追加；接受 / 重放 / 拒绝）</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr>
+            <th>接收序</th><th>标识</th><th>采样时刻</th><th>(x, y)</th>
+            <th>结论</th><th>修订</th><th>原因 / 说明</th>
+          </tr></thead>
+          <tbody id="logBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
